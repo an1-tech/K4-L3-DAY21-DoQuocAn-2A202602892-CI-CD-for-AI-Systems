@@ -1,0 +1,5 @@
+[core]
+    remote = labstore
+['remote "labstore"']
+    url = s3://doquocan-day21-2a202602892-519232/dvc
+    region = ap-southeast-2

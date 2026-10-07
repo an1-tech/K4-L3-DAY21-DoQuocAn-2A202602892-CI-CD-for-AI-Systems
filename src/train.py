@@ -1,17 +1,29 @@
+import json
+import os
+from pathlib import Path
+
+import joblib
 import mlflow
 import mlflow.sklearn
 import pandas as pd
 import yaml
-import json
-import joblib
-import os
 from sklearn.ensemble import GradientBoostingClassifier
 from sklearn.metrics import accuracy_score, f1_score
 
-# Nguong chat luong cua lab nay la f1_score, KHONG phai accuracy.
-# Ly do: bo du lieu Adult co ty le lop 75/25. Mot mo hinh doan bua
-# "thu nhap thap" cho moi mau da dat accuracy 0.75 ma khong hoc duoc gi.
 F1_THRESHOLD = 0.65
+
+FEATURE_NAMES = [
+    "age",
+    "workclass",
+    "education_num",
+    "marital_status",
+    "occupation",
+    "relationship",
+    "sex",
+    "capital_gain",
+    "capital_loss",
+    "hours_per_week",
+]
 
 
 def train(
@@ -19,70 +31,90 @@ def train(
     data_path: str = "data/train_batch1.csv",
     eval_path: str = "data/holdout.csv",
 ) -> float:
-    """
-    Huan luyen mo hinh va ghi nhan ket qua vao MLflow.
+    # Đọc dữ liệu và giữ đúng thứ tự đặc trưng.
+    df_train = pd.read_csv(data_path)
+    df_eval = pd.read_csv(eval_path)
 
-    Tham so:
-        params     : dict chua cac sieu tham so cho GradientBoostingClassifier.
-        data_path  : duong dan den file du lieu huan luyen.
-        eval_path  : duong dan den file du lieu danh gia (holdout).
+    X_train = df_train[FEATURE_NAMES]
+    y_train = df_train["target"]
+    X_eval = df_eval[FEATURE_NAMES]
+    y_eval = df_eval["target"]
 
-    Tra ve:
-        f1 (float): diem F1 cua lop duong (thu nhap > 50K) tren tap holdout.
-    """
+    # Cấu hình nơi lưu thí nghiệm.
+    mlflow.set_tracking_uri(
+        os.environ.get("MLFLOW_TRACKING_URI", "sqlite:///mlflow.db")
+    )
 
-    # TODO 1: Doc du lieu huan luyen va danh gia
-    # df_train = ...
-    # df_eval  = ...
+    artifact_root = Path(
+        os.environ.get("MLFLOW_ARTIFACT_ROOT", "./mlartifacts")
+    ).resolve()
+    artifact_root.mkdir(parents=True, exist_ok=True)
 
-    # TODO 2: Tach dac trung (X) va nhan (y)
-    # X_train = df_train.drop(columns=["target"])
-    # y_train = ...
-    # X_eval  = ...
-    # y_eval  = ...
+    experiment_name = "day21-income"
+    client = mlflow.tracking.MlflowClient()
+    experiment = client.get_experiment_by_name(experiment_name)
 
-    with mlflow.start_run():
+    if experiment is None:
+        experiment_id = client.create_experiment(
+            experiment_name,
+            artifact_location=artifact_root.as_uri(),
+        )
+    else:
+        experiment_id = experiment.experiment_id
 
-        # TODO 3: Ghi nhan cac sieu tham so
-        # mlflow.log_params(...)
+    mlflow.set_experiment(experiment_id=experiment_id)
 
-        # TODO 4: Khoi tao va huan luyen GradientBoostingClassifier
-        # Goi y: su dung random_state=42 de dam bao tinh tai tao
-        # model = GradientBoostingClassifier(...)
-        # model.fit(...)
+    run_name = (
+        f"trees-{params['n_estimators']}"
+        f"_lr-{params['learning_rate']}"
+        f"_depth-{params['max_depth']}"
+    )
 
-        # TODO 5: Du doan tren tap holdout va tinh chi so
-        # Chu y: f1_score o day tinh cho LOP DUONG (target = 1), khong dung average.
-        # preds = ...
-        # f1    = f1_score(...)
-        # acc   = accuracy_score(...)
+    with mlflow.start_run(run_name=run_name) as run:
+        mlflow.log_params(params)
+        mlflow.log_param("random_state", 42)
 
-        # TODO 6: Ghi nhan chi so vao MLflow
-        # mlflow.log_metric("f1_score", ...)
-        # mlflow.log_metric("accuracy", ...)
-        # mlflow.sklearn.log_model(model, "model")
+        model = GradientBoostingClassifier(
+            **params,
+            random_state=42,
+        )
+        model.fit(X_train, y_train)
 
-        # TODO 7: In ket qua ra man hinh
-        # print(f"F1: {f1:.4f} | Accuracy: {acc:.4f}")
+        predictions = model.predict(X_eval)
 
-        # TODO 8: Luu metrics ra file outputs/report.json
-        # File nay duoc doc boi GitHub Actions o Buoc 2
-        # os.makedirs("outputs", exist_ok=True)
-        # with open("outputs/report.json", "w") as f:
-        #     json.dump({"f1_score": f1, "accuracy": acc}, f)
+        # Tính F1 riêng cho lớp dương: thu nhập >50K.
+        f1 = float(f1_score(y_eval, predictions, zero_division=0))
+        accuracy = float(accuracy_score(y_eval, predictions))
 
-        # TODO 9: Luu mo hinh ra file models/model.joblib
-        # File nay duoc upload len cloud storage o Buoc 2
-        # os.makedirs("models", exist_ok=True)
-        # joblib.dump(model, "models/model.joblib")
+        mlflow.log_metric("f1_score", f1)
+        mlflow.log_metric("accuracy", accuracy)
+        mlflow.sklearn.log_model(model, "model")
 
-        pass  # xoa dong nay sau khi hoan thanh tat ca TODO ben tren
+        Path("outputs").mkdir(exist_ok=True)
+        report = {
+            "f1_score": f1,
+            "accuracy": accuracy,
+            "train_rows": int(len(df_train)),
+            "eval_rows": int(len(df_eval)),
+            "params": params,
+            "run_id": run.info.run_id,
+        }
 
-    # TODO 10: Tra ve f1
-    # return f1
+        with open("outputs/report.json", "w", encoding="utf-8") as file:
+            json.dump(report, file, indent=2, ensure_ascii=False)
+
+        Path("models").mkdir(exist_ok=True)
+        joblib.dump(model, "models/model.joblib")
+
+        print(f"Train rows: {len(df_train)}")
+        print(f"F1: {f1:.4f} | Accuracy: {accuracy:.4f}")
+        print(f"MLflow run: {run.info.run_id}")
+
+    return f1
 
 
 if __name__ == "__main__":
-    with open("params.yaml") as f:
-        params = yaml.safe_load(f)
+    with open("params.yaml", encoding="utf-8") as file:
+        params = yaml.safe_load(file)
+
     train(params)
