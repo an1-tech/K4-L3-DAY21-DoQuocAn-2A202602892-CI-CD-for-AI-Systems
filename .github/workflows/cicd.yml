@@ -177,26 +177,70 @@ jobs:
           test -n "$RULE_ID" && test "$RULE_ID" != "None" || { echo "SSH rule ID was not returned."; exit 1; }
           echo "rule_id=$RULE_ID" >> "$GITHUB_OUTPUT"
           echo "Temporary SSH access configured for $RUNNER_IP/32."
+      - name: Verify ED25519 host key and prepare SSH
+        env:
+          SERVER_HOST: ${{ secrets.SERVER_HOST }}
+          SERVER_SSH_KEY: ${{ secrets.SERVER_SSH_KEY }}
+          SERVER_FINGERPRINT: ${{ secrets.SERVER_FINGERPRINT }}
+        run: |
+          for attempt in $(seq 1 5); do
+            if ssh-keyscan -T 5 -t ed25519 "$SERVER_HOST" > "$RUNNER_TEMP/income-known-hosts" 2>/dev/null; then
+              break
+            fi
+            sleep 2
+          done
+          python - <<'PY'
+          import hmac
+          import os
+          from pathlib import Path
+          import subprocess
+
+          known_hosts = Path(os.environ["RUNNER_TEMP"]) / "income-known-hosts"
+          if not known_hosts.is_file() or not known_hosts.read_text().strip():
+              raise SystemExit("Could not obtain the EC2 ED25519 host key")
+          result = subprocess.check_output(
+              ["ssh-keygen", "-lf", str(known_hosts), "-E", "sha256"], text=True
+          )
+          lines = result.strip().splitlines()
+          expected = os.environ["SERVER_FINGERPRINT"].strip()
+          if len(lines) != 1 or "(ED25519)" not in lines[0]:
+              raise SystemExit("Expected exactly one ED25519 host key")
+          actual = lines[0].split()[1]
+          if not hmac.compare_digest(actual, expected):
+              raise SystemExit(
+                  f"ED25519 fingerprint mismatch. EC2 returned {actual}; "
+                  "verify SERVER_HOST and SERVER_FINGERPRINT against the trusted EC2 session."
+              )
+          key = Path(os.environ["RUNNER_TEMP"]) / "income-deploy-key"
+          private_key = os.environ["SERVER_SSH_KEY"].replace("\r\n", "\n").strip()
+          key.write_text(private_key + "\n", encoding="utf-8")
+          key.chmod(0o600)
+          print("ED25519 host fingerprint verified.")
+          PY
+      - name: Copy serving code to EC2
+        env:
+          SERVER_HOST: ${{ secrets.SERVER_HOST }}
+          SERVER_USER: ${{ secrets.SERVER_USER }}
+        run: |
+          scp -i "$RUNNER_TEMP/income-deploy-key" \
+            -o BatchMode=yes -o IdentitiesOnly=yes -o ConnectTimeout=15 \
+            -o HostKeyAlgorithms=ssh-ed25519 \
+            -o StrictHostKeyChecking=yes \
+            -o UserKnownHostsFile="$RUNNER_TEMP/income-known-hosts" \
+            src/serve.py "${SERVER_USER}@${SERVER_HOST}:/home/${SERVER_USER}/src/serve.py"
       - name: Publish approved model to S3
         run: python -m scripts.upload_model
-      - name: Copy serving code to EC2
-        uses: appleboy/scp-action@v0.1.7
-        with:
-          host: ${{ secrets.SERVER_HOST }}
-          username: ${{ secrets.SERVER_USER }}
-          key: ${{ secrets.SERVER_SSH_KEY }}
-          fingerprint: ${{ secrets.SERVER_FINGERPRINT }}
-          source: src/serve.py
-          target: /home/${{ secrets.SERVER_USER }}/src
-          strip_components: 1
       - name: Restart API and verify health
-        uses: appleboy/ssh-action@v1.0.3
-        with:
-          host: ${{ secrets.SERVER_HOST }}
-          username: ${{ secrets.SERVER_USER }}
-          key: ${{ secrets.SERVER_SSH_KEY }}
-          fingerprint: ${{ secrets.SERVER_FINGERPRINT }}
-          script: |
+        env:
+          SERVER_HOST: ${{ secrets.SERVER_HOST }}
+          SERVER_USER: ${{ secrets.SERVER_USER }}
+        run: |
+          ssh -i "$RUNNER_TEMP/income-deploy-key" \
+            -o BatchMode=yes -o IdentitiesOnly=yes -o ConnectTimeout=15 \
+            -o HostKeyAlgorithms=ssh-ed25519 \
+            -o StrictHostKeyChecking=yes \
+            -o UserKnownHostsFile="$RUNNER_TEMP/income-known-hosts" \
+            "${SERVER_USER}@${SERVER_HOST}" 'bash -s' <<'REMOTE'
             set -eu
             sudo -n /usr/bin/systemctl restart income-api
             for attempt in $(seq 1 30); do
@@ -209,6 +253,7 @@ jobs:
             done
             echo "Health check failed."
             exit 1
+          REMOTE
       - name: Remove this runner's temporary SSH rule
         if: ${{ always() && steps.ssh_access.outputs.rule_id != '' }}
         env:
